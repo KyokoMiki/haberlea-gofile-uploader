@@ -1,0 +1,13 @@
+[build-system]
+requires = ["uv_build"]
+build-backend = "uv_build"
+
+[project]
+name = "haberlea-gofile-uploader"
+version = "0.1.0"
+description = "Gofile upload extension for Haberlea (batch upload after all downloads complete)"
+requires-python = ">=3.11"
+dependencies = ["msgspec>=0.20.0", "aiohttp>=3.13.2"]
+
+[project.entry-points."haberlea.extensions"]
+gofile_uploader = "haberlea_gofile_uploader:extension_settings"

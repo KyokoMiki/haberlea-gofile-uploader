@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 import msgspec
@@ -26,10 +26,10 @@ from rich.progress import (
 from haberlea.plugins.base import ExtensionBase
 from haberlea.utils.models import ExtensionInformation
 from haberlea.utils.progress import BinaryTransferSpeedColumn
+from haberlea.utils.utils import compress_to_zip, delete_path
 
 if TYPE_CHECKING:
     from haberlea.download_queue import DownloadJob
-from haberlea.utils.utils import compress_to_zip, delete_path
 
 logger = logging.getLogger(__name__)
 
@@ -107,17 +107,27 @@ def _render_progress_to_string(progress: Progress) -> str:
     return string_io.getvalue().strip()
 
 
+class GofileState:
+    """Mutable upload state for GofileUploader — instance-level, not class-level."""
+
+    def __init__(self) -> None:
+        self._collected_paths: list[Path] = []
+        self._lock: asyncio.Lock | None = None
+        self._finalized: bool = False
+
+    def get_lock(self) -> asyncio.Lock:
+        """Get or create the lock."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+
 class GofileUploader(ExtensionBase):
     """Extension for batch uploading files to Gofile.io.
 
     This extension collects all download paths and creates a single ZIP
     archive containing all of them, then uploads to Gofile.
     """
-
-    # Class-level storage for collected paths (shared across all calls)
-    _collected_paths: ClassVar[list[Path]] = []
-    _lock: ClassVar[asyncio.Lock | None] = None
-    _finalized: ClassVar[bool] = False
 
     def __init__(self, settings: dict[str, Any]) -> None:
         """Initialize the extension.
@@ -127,17 +137,7 @@ class GofileUploader(ExtensionBase):
         """
         super().__init__(settings)
         self.settings = msgspec.convert(settings, ExtensionSettings)
-
-    @classmethod
-    def _get_lock(cls) -> asyncio.Lock:
-        """Get or create the class-level lock.
-
-        Returns:
-            The shared asyncio.Lock instance.
-        """
-        if cls._lock is None:
-            cls._lock = asyncio.Lock()
-        return cls._lock
+        self._state = GofileState()
 
     async def on_job_complete(self, job: "DownloadJob") -> None:
         """Collect download path for batch processing.
@@ -152,20 +152,20 @@ class GofileUploader(ExtensionBase):
             logger.debug("Gofile upload is disabled")
             return
 
-        if not job.download_path:
+        if not job.definition.download_path:
             logger.warning("Job has no download path: %s", job.job_id)
             return
 
-        path = Path(job.download_path.rstrip("/\\"))
+        path = job.definition.download_path
 
         if not path.exists():
             logger.warning("Download path does not exist: %s", path)
             return
 
-        async with GofileUploader._get_lock():
+        async with self._state.get_lock():
             # Avoid duplicates
-            if path not in GofileUploader._collected_paths:
-                GofileUploader._collected_paths.append(path)
+            if path not in self._state._collected_paths:
+                self._state._collected_paths.append(path)
                 logger.info("Collected path for Gofile upload: %s", path)
 
     async def on_all_complete(self) -> None:
@@ -173,14 +173,14 @@ class GofileUploader(ExtensionBase):
 
         Creates a ZIP archive of all collected paths and uploads to Gofile.
         """
-        async with GofileUploader._get_lock():
-            if GofileUploader._finalized or not GofileUploader._collected_paths:
+        async with self._state.get_lock():
+            if self._state._finalized or not self._state._collected_paths:
                 logger.debug("No paths to upload or already finalized")
                 return
 
-            GofileUploader._finalized = True
-            paths = GofileUploader._collected_paths.copy()
-            GofileUploader._collected_paths.clear()
+            self._state._finalized = True
+            paths = self._state._collected_paths.copy()
+            self._state._collected_paths.clear()
 
         # self.settings is already converted to ExtensionSettings in __init__
         ext_settings = self.settings
@@ -219,7 +219,7 @@ class GofileUploader(ExtensionBase):
                 logger.info("ZIP archive created successfully: %s", upload_path)
             except OSError as e:
                 logger.error("Failed to create ZIP archive: %s", e)
-                GofileUploader._finalized = False
+                self._state._finalized = False
                 return
 
         # Upload to Gofile
@@ -240,13 +240,12 @@ class GofileUploader(ExtensionBase):
                         await delete_path(source_path)
 
         # Reset for next batch
-        GofileUploader._finalized = False
+        self._state._finalized = False
 
-    @classmethod
-    def reset(cls) -> None:
-        """Reset the collector state for a new batch."""
-        cls._collected_paths.clear()
-        cls._finalized = False
+    def reset(self) -> None:
+        """Reset instance state for a new batch."""
+        self._state._collected_paths.clear()
+        self._state._finalized = False
 
     async def _create_file_sender(
         self,
